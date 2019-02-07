@@ -1,5 +1,6 @@
 """
 AIR model using slim
+    without r-step (Repeat step)
 """
 # Importing tensorflow
 import tensorflow as tf
@@ -30,16 +31,7 @@ def gaussian_log_likelihood(x, mean, var, eps=1e-8):
     return -0.5 * tf.reduce_sum( tf.log(2.*np.pi*var + eps)
                                + bb, axis=1)
 
-#fashion_mnist = keras.datasets.fashion_mnist
-#(train_images, train_labels), (test_images, test_labels) = fashion_mnist.load_data()
-#(train_images, train_labels), (test_images, test_labels)  = mnist.load_data()
-#x_train = np.load('mnis_single.npy')
-#x_train = x_train[0].astype('float32')
-#x_train = np.load('fashion_sing.npy')/255
-#x_train = np.load('bmnist_sing.npy')/255
-#train_images = train_images.astype('float32') / 255
-#test_images = test_images.astype('float32') / 255
-data_type = 1
+data_type = 2
 if data_type == 1:
     x_train = np.load('mnist_sing.npy')/255
     y_train = np.load('nmist_label.npy')
@@ -60,15 +52,12 @@ all_images = all_images.astype('float32')
 
 
 # Deciding how many nodes wach layer should have
-n_nodes_inpl = 784  #encoder
-n_nodes_hl1  = 32  #encoder
-n_nodes_hl2  = 32  #decoder
-n_nodes_outl = 784  #decoder
+rnn_hidden_units = (8,16,32)
 rec_hidden_units = (32, 16) #(512, 256)
 vae_generative_units= (16,32)#256, 512)
 vae_likelihood_std=0.3
 hidden_units = 64
-latent_dim = 5
+latent_dim = 20
 pic_size = 50
 win_size = 28
 
@@ -85,9 +74,9 @@ with tf.variable_scope("hidden_rnn"):
         activation_fn=lambda x: tf.nn.leaky_relu(x, alpha=0.1),
         normalizer_params={"is_training": is_train}):
 
-        for i in range(3):
-            net = slim.conv2d(net, 32, [3, 3], scope="conv%d" % (i*2+1))
-            net = slim.conv2d(net, 32, [3, 3], stride=2, scope="conv%d" % (i*2+2))
+        for i in range(len(rnn_hidden_units)):
+            net = slim.conv2d(net, rnn_hidden_units[i], [3, 3], scope="conv%d" % (i*2+1))
+            net = slim.conv2d(net, rnn_hidden_units[i], [3, 3], stride=2, scope="conv%d" % (i*2+2))
 
         net = slim.flatten(net)
         rnn_out = slim.fully_connected(net, 128)
@@ -106,8 +95,7 @@ with tf.variable_scope("scale"):
             scale_log_variance = layers.fully_connected(hidden, 1, activation_fn=None, scope=scope)
     scale_variance = tf.exp(scale_log_variance)
     scale = tf.nn.sigmoid(sample_from_mvn(scale_mean, scale_variance))
-    #scale = tf.nn.sigmoid(scale_mean)
-
+    #scale = tf.nn.sigmoid(scale_mean)  #with out randomness
     s = scale[:, 0]
 
 with tf.variable_scope("shift"):
@@ -124,7 +112,7 @@ with tf.variable_scope("shift"):
             shift_log_variance = layers.fully_connected(hidden, 2, activation_fn=None, scope=scope)
     shift_variance = tf.exp(shift_log_variance)
     shift = tf.nn.tanh(sample_from_mvn(shift_mean, shift_variance))
-    #shift = tf.nn.tanh(shift_mean)
+    #shift = tf.nn.tanh(shift_mean) #with out randomness
     x, y = shift[:, 0], shift[:, 1]
 
 
@@ -149,9 +137,8 @@ with tf.variable_scope("vae"):
         rec_sample = rec_mean + 1*standard_normal_sample * tf.sqrt(tf.exp(rec_log_var))
 
     rec                   = decoder(rec_sample, is_train, [0,7,7,16],vae_generative_units, latent_dim)
-    print(rec.shape)
     rec = tf.reshape(rec,[-1,win_size,win_size])
-    #print(window.shape)
+
 
 with tf.variable_scope("st_backward"):
     theta_recon = tf.stack([
@@ -218,8 +205,8 @@ with tf.variable_scope("recon_loss1"):
     vae_kl = 0.5 * tf.reduce_sum( tf.log(1.1) - rec_log_var - 1.0 + tf.exp(rec_log_var)/1.1 +
         tf.square(rec_mean - 0.0)/1.1 , 1)
     vae_kl = tf.reduce_mean(vae_kl)
-    if data_type == 1:
-        vae_loss = binarcs +scale_kl +shift_kl+vae_kl*0.01
+    if data_type == 1 or data_type == 2:
+        vae_loss = binarcs + meansq +scale_kl +shift_kl+vae_kl*0.01
     elif data_type == 2:
         vae_loss = meansq +scale_kl +shift_kl+vae_kl*0.01
 
@@ -230,14 +217,14 @@ with tf.variable_scope("trick_term"):
     trick = -tf.reduce_mean(tf.square(window))#*60*5#*.01
     trick2 = tf.reduce_mean(tf.square(s - position[:,0]))*1
     trick2 += 0.1*tf.reduce_mean(tf.square(x - position[:,1])+tf.square(y - position[:,2]))
-    trick_loss = meansq*0+trick2 #+scale_kl +shift_kl
+    trick_loss = meansq*0.01+trick2 #+scale_kl +shift_kl
 
 t_vars = tf.trainable_variables()
 vae_vars = [var for var in t_vars if 'vae' in var.name]
 # define our optimizer
 learn_rate = 0.0002   # how fast the model should learn
 
-slimopt = slim.learning.create_train_op(vae_loss, tf.train.AdamOptimizer(0.001))
+slimopt = slim.learning.create_train_op(vae_loss, tf.train.AdamOptimizer(0.0005))
 slimopt2= slim.learning.create_train_op(trick_loss, tf.train.AdamOptimizer(0.001))
 
 # initialising stuff and starting the session
@@ -267,21 +254,14 @@ summary = tf.summary.merge([
                 ])
 
 
-def plot_results(model_name="vae_mnist"):
+def plot_results(model_name="vae_mnist",index = 0):
     #import os
     import matplotlib.pyplot as plt
     if not os.path.exists(model_name):
         os.makedirs(model_name)
 
     x_true = all_images[10:30].copy()
-    #p = 28*2
-    #x_true[:,p:p+10] = 0.8
-    #x_true[14]=img.flatten()
-    filename = os.path.join(model_name, "compair.png")
-    #x_encoded = encoder.predict(x_train)
-    #x_decoded = decoder.predict(x_encoded)
-    #x_encoded = sess.run(rec_mean,\
-    #            feed_dict={input_layer:x_true})
+    filename = os.path.join(model_name, "compair%02d.png"%(index))
     num_rows = 5
     num_cols = 3
     num_images = num_rows*num_cols
@@ -338,7 +318,7 @@ def plot_results(model_name="vae_mnist"):
 
 # defining batch size, number of epochs and learning rate
 batch_size = 256   # how many images to use together for training
-hm_epochs = 71     # how many times to go through the entire dataset
+hm_epochs = 101     # how many times to go through the entire dataset
 tot_images = 60000 # total number of images
 
 kl = 0
@@ -348,7 +328,7 @@ for epoch in range(hm_epochs):
         epoch_x = all_images[ i*batch_size : (i+1)*batch_size ]
         posi    = y_train[ i*batch_size : (i+1)*batch_size ]
         #_,c = sess.run([optimizer2,vae_loss],feed_dict={input_layer:epoch_x, output_true:epoch_x})
-        if (epoch<1 or (epoch%5<=21 and epoch<31) or (epoch%5==0 and epoch<61)):
+        if (epoch<1 or (epoch%5<=1 and epoch<11) or (epoch%5==0 and epoch<31)):
             _,c = sess.run([slimopt2,vae_loss],feed_dict={input_layer:epoch_x,
                   output_true:epoch_x , is_train:True, position:posi})
         else:
@@ -360,13 +340,13 @@ for epoch in range(hm_epochs):
     summ = sess.run(summary, feed_dict={input_layer: epoch_x, \
        output_true: epoch_x, is_train: False, position:posi})
     writer.add_summary(summ,epoch)
-    if epoch%2==0:
+    if epoch%10==0:
         print('Epoch', epoch, '/', hm_epochs, 'loss:',epoch_loss)
-        #plot_results(model_name=("vae_test/"+str(epoch)))
+        plot_results(model_name="air_test/",index =epoch)
     if epoch%100 == 0:
         if not os.path.exists('./model'):
             os.makedirs('./model')
         saver.save(sess, './model/' + str(i))
 
-plot_results(model_name="vae_test")
+plot_results(model_name="air_test",index=100)
 #plt.show()
