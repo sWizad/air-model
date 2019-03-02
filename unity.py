@@ -87,7 +87,7 @@ def decoder(inputs, is_train, input_dim, gen_hidden_units, latent_dim, activatio
 
 
     with tf.variable_scope("gen_mean") as scope:
-        generative_mean = slim.conv2d_transpose(next_layer, 1, [3, 3],activation_fn=None, padding='same', scope=scope)
+        generative_mean = slim.conv2d_transpose(next_layer, input_dim[0], [3, 3],activation_fn=None, padding='same', scope=scope)
 
 
     with tf.variable_scope("gen_sample"):
