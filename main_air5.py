@@ -1,6 +1,6 @@
 """
 AIR model using slim
-    Fully with r-step (Repeat step)
+    worked without r-step (Repeat step)
     Colorful images batch
     Use Gaussian-Mixture and Gumbel-softmax to find the box location
 """
@@ -16,7 +16,7 @@ import cv2
 # Importing some more libraries
 import numpy as np
 import matplotlib.pyplot as plt
-from unity import  colored_hook,encoder, decoder, soft_ncut
+from unity import  colored_hook,encoder, decoder
 from transformer import spatial_transformer_network
 
 
@@ -68,6 +68,7 @@ def make_dis_weight(h,var_position=5.0):
 
     return dist_weight
 
+
 data_type = 1
 color_ch = 1    #colorful picture or grey scal
 if data_type == 1:
@@ -76,7 +77,8 @@ elif data_type == 2:
     (train_images, train_labels), (test_images, test_labels)  = fashion_mnist.load_data()
 
 Blank_bg = True
-AIR_type = 1 #0 = VAE, 1 = AIR, 2 = AIR_dis
+GMM_EM = False
+
 
 # Deciding how many nodes wach layer should have
 rnn_hidden_units = (5, 3, 3, 5, 5, 3, 3, 1, 1)
@@ -84,11 +86,10 @@ rec_hidden_units = (32,16) #(512, 256)
 vae_generative_units= (16,32)#256, 512)
 vae_likelihood_std=0.3
 hidden_units = 64
-latent_dim = 10
+latent_dim = 10*color_ch*color_ch
 pic_size = 56
 win_size = 28
-T = 2
-
+T = 3
 z_pres_temperature = 1.0
 
 batch_size = 256   # how many images to use together for training
@@ -115,7 +116,7 @@ def get_batch(batch_size = 256, begin_point = 0, is_train=True):
 
     batch = np.zeros((batch_size, pic_size, pic_size, color_ch))
     global seed
-    seed  = 313
+    seed  = 331
     for i in range(batch_size):
         x = int(psu_rand(is_train)*711)
         y = int(psu_rand(is_train)*732)
@@ -125,40 +126,53 @@ def get_batch(batch_size = 256, begin_point = 0, is_train=True):
         if color_ch ==1:
             bg = np.mean(bg,axis=2,keepdims=True)
         if Blank_bg:
-            bg *= 0.0
+            bg = bg*0.0
             num_digit = T
         else:
             for i2 in range(color_ch):
-                bg[:,:,i2] = (bg[:,:,i2]+ (psu_rand(is_train)*255.0)) / 5.0
-            num_digit = T-1
-        if AIR_type == 0:
-            num_digit =1
+                bg[:,:,i2] = (bg[:,:,i2]+ (psu_rand(is_train)*255.0)) / 2.5
+            num_digit = T
+
+        x_prv = 10.0
+        y_prv = 10.0
+        s_prv = 0.33
         for i1 in range(num_digit):
-            if AIR_type == 0:
-                x, y, s = -0.2, -0.2, 1.5
-            else:
-                x = psu_rand(is_train)*2*.75-.75
-                y = psu_rand(is_train)*2*.75-.75
-                s = 1. / (1. + np.exp(np.sqrt(-2*np.log(psu_rand(is_train)))*np.cos(np.pi*2*psu_rand(is_train))*0.1))+0.5
-                #s = 0.51
+            pres = 1 if i1==0 else (psu_rand(is_train)<0.99)
+            if not pres:
+                break
+            count = 0
+            while (1):
+                x = psu_rand(is_train)*1.7-.85
+                y = psu_rand(is_train)*1.7-.85
+                S = np.sqrt(-2*np.log(psu_rand(is_train)+1e-8))*np.cos(np.pi*2*psu_rand(is_train))*0.15
+                s = 1.661*np.log(1. +  np.exp(S))
+                if (abs(x_prv-x)+abs(y_prv-y)>(s_prv + s)*0.5) and (min(x,y)-s*.5 > -1) and (max(x,y)+s*.5 < 1):
+                    break
+                else:
+                    count += 1
+                    if count == 350: break
+
+            x_prv = x
+            y_prv = y
+            s_prv = s
+            #s = 0.51
             if i1 == 0:
                 digit_img = train_images[begin_point+i]
             else:
                 digit_img = train_images[int(psu_rand(is_train)*tot_images)]
             M = np.float32([[s,0,(x+0.5)*(pic_size-win_size)],[0,s,(y+0.5)*(pic_size-win_size)]])
             c1 = cv2.warpAffine(digit_img,M,(pic_size,pic_size))
-            pres = 1 if i1==0 else (psu_rand(is_train)<0.5)
             for i2 in range(color_ch):
                 bg[:,:,i2] = bg[:,:,i2]*(1-c1/255)+(c1)*(psu_rand(is_train)*0.25+0.75)*pres+(1-pres)*bg[:,:,i2]*(c1/255)
         batch[i] =bg[:,:,:]/255
     return batch
 
-"""#test batch
-init = tf.global_variables_initializer()
-sess = tf.Session()
-sess.run(init)
-
-batch = get_batch(100,is_train=True)
+#test batch
+#init = tf.global_variables_initializer()
+#sess = tf.Session()
+#sess.run(init)
+"""
+batch = get_batch(100,is_train=False)
 num_rol = 3
 num_col = 5
 num_pl = num_col*num_rol
@@ -178,26 +192,51 @@ exit()
 
 
 def main(arv):
-    dist_weight = tf.constant(make_dis_weight(pic_size),dtype=tf.float32)
-    dist_weight = tf.expand_dims(dist_weight,axis = 0)
+    dist_weight = tf.constant(make_dis_weight(pic_size))
     DO_SHARE = None
     lstm_rnn = tf.contrib.rnn.LSTMCell(50, state_is_tuple=True)
 
     input_layer = tf.placeholder('float32', shape=[None, pic_size,pic_size,color_ch], name = "input")
     is_train = tf.placeholder(tf.bool, name='is_train')
     #rnn_out = layers.fully_connected(input_layer, pic_size*pic_size,activation_fn=tf.nn.relu,scope="hidden_rnn")
-    def hidden_rnn(input,state):
+    def hidden_rnn(input,x_hat,field,state):
         with tf.variable_scope("hidden_rnn",reuse=DO_SHARE):
-            net = input#tf.concat([input, x_hat],axis=3)
+            #net = tf.concat([input, x_hat],axis=3)
             with slim.arg_scope(
                 [slim.conv2d, slim.fully_connected],
                 normalizer_fn=slim.batch_norm,
                 activation_fn=lambda x: tf.nn.leaky_relu(x, alpha=0.1),
                 normalizer_params={"is_training": is_train}):
+                #net = tf.reshape(rnn_out1,[-1,int(pic_size/4),int(pic_size/4),1])
+                #for i in range(2):
+                #    net  = slim.conv2d_transpose(net , 2, [3, 3], stride=2, scope="convt%d" % (i+1))
+
+                net = tf.concat([input,x_hat,field],axis=3)
+                for i in range(len(rnn_hidden_units)):
+                    net = slim.conv2d(net, 6, [3, 3] , rate = rnn_hidden_units[i], scope="conva%d" % (i+1))
+                rnn_out2 = net
+
+                net = tf.concat([input,rnn_out2],axis=3)
                 for i in range(2):
                     net = slim.conv2d(net, 1, [3, 3], stride=2, scope="conv%d" % (i+1))
                 rnn_out1, state = lstm_rnn(slim.flatten(net), state)
-            return rnn_out1, state
+
+            return rnn_out1,rnn_out2, state
+
+    def pre_loop(input,x_hat):
+        with tf.variable_scope("pre_loop",reuse=DO_SHARE):
+            with slim.arg_scope(
+                [slim.conv2d, slim.fully_connected],
+                normalizer_fn=slim.batch_norm,
+                activation_fn=lambda x: tf.nn.leaky_relu(x, alpha=0.1),
+                normalizer_params={"is_training": is_train}):
+                net = tf.concat([input,x_hat],axis=3)
+                for i in range(len(rnn_hidden_units)):
+                    net = slim.conv2d(net, 6, [3, 3] , rate = rnn_hidden_units[i], scope="conva%d" % (i+1))
+                rnn_out2 = slim.conv2d(net, T, [3, 3], scope="output_layer")
+                rnn_out2 = tf.nn.softmax(rnn_out2, axis=3)
+
+        return rnn_out2
 
     def enc_block(input,filter=32,kernel_size = 3,block=''):
         with slim.arg_scope(
@@ -250,19 +289,32 @@ def main(arv):
 
                 output = slim.conv2d(net, T, [3, 3], scope="output_layer")
 
-            return tf.nn.softmax(output, axis=3)
-
+            return output#tf.nn.softmax(output, axis=[1,2])
 
     def comp_scale(rnn_out,scale_kl):
         with tf.variable_scope("scale",reuse=DO_SHARE):
-            if t ==0 and (not Blank_bg):
+            if t ==0 and (not Blank_bg) and (False):
                 s = tf.ones([tf.shape(rnn_out)[0],])*1
             else:
-                s = tf.ones([tf.shape(rnn_out)[0],])*0.5
-            #    scale_kl += tf.reduce_mean(0.5 * tf.reduce_sum(tf.log(0.1)- scale_log_variance - 1.0 + scale_variance/0.1
-            #                + tf.square(scale_mean - 0.0)/0.1 , 1))
+                #s = tf.ones([tf.shape(rnn_out)[0],])*0.5
+                net = rnn_out
+                for i in range(2):
+                    net = slim.conv2d(net, 1, [3, 3], stride=2, scope="s_conv%d" % (i+1))
+                net = slim.flatten(net)
+                hidden = layers.fully_connected(net , hidden_units, scope="hidden")
+                scale_mean = layers.fully_connected(hidden, 1, activation_fn=None, scope="scale_mean")
+                scale_log_var = layers.fully_connected(hidden, 1, activation_fn=None, scope="scale_log_var")
+                scale_variance = tf.exp(scale_log_var)
+                s = 0.5 * tf.nn.softplus(sample_from_mvn(scale_mean, scale_variance))
+                s = s[:,0]
+                scale_kl += tf.reduce_mean(0.5 * tf.reduce_sum(tf.log(0.1)- scale_log_var - 1.0 + scale_variance/0.1
+                            + tf.square(scale_mean - 0.0)/0.1 , 1))
+                hidden = layers.fully_connected(net, hidden_units, scope="hidden2")
+                sigma_mean = layers.fully_connected(hidden, 1, activation_fn=None, scope="sigma2_mean")
 
-        return s, scale_kl
+                sigma2 = 0.5 * tf.nn.softplus(sigma_mean)
+                sigma2 = sigma2[:,0]
+        return s, sigma2, scale_kl
 
     def comp_shift2(rnn_out2, shift_kl):
         with tf.variable_scope("shift",reuse=DO_SHARE):
@@ -270,27 +322,42 @@ def main(arv):
               r = np.arange(0.5, h, 1) / (h / 2) - 1
               ranx, rany = tf.meshgrid(r, r)
               return tf.to_float(ranx), tf.to_float(rany)
-            #prob = slim.conv2d( rnn_out2, 1, [3, 3], rate=1, scope="prob1", activation_fn=None)
-            #prob = slim.conv2d( prob, 1, [3, 3], rate=1, scope="prob2", activation_fn=None)
-            prob = slim.separable_conv2d( rnn_out2,1,[7,7],rate=1,normalizer_fn=slim.batch_norm)
+            prob = slim.conv2d( rnn_out2, 1, [3, 3], rate=1, scope="prob1", activation_fn=None)
+            prob = slim.conv2d( prob, 1, [3, 3], rate=1, scope="prob2", activation_fn=None)
             prob = tf.transpose(prob, [0, 3, 1, 2])
 
             prob = tf.reshape(prob, [-1,pic_size * pic_size])
-            #prob = tf.nn.softmax(prob, name="softmax")
-            prob = tf.nn.softplus(prob)
-            prob_sum = tf.maximum(tf.expand_dims(tf.reduce_sum(prob,1),1),1e-10)
-            prob = prob/prob_sum
+            if GMM_EM:
+                prob = tf.nn.softplus(prob)
+                prob_sum = tf.maximum(tf.expand_dims(tf.reduce_sum(prob,1),1),1e-10)
+                prob = prob/prob_sum
+            else:
+                prob = tf.nn.softmax(prob, name="softmax")
+
             ranx, rany = meshgrid(pic_size)
             prob = tf.reshape(prob, [-1,pic_size, pic_size])
 
-            if t == 0 and (not Blank_bg):
+            """# test distribution
+            prob3 = tf.square(ranx-tf.ones_like(prob)*0.5)+tf.square(rany-tf.ones_like(prob)*(-0.25))
+            prob3 = tf.exp(-prob3*0.5/0.1)/np.sqrt(2*np.pi*0.1)
+            prob_sum = tf.maximum(tf.expand_dims(tf.reduce_sum(prob3,axis=[1,2]),1),1e-10)
+            prob3 = prob3/tf.expand_dims(prob_sum,1)
+
+            prob4 = tf.square(ranx-tf.ones_like(prob)*(-0.5))+tf.square(rany-tf.ones_like(prob)*(+0.25))
+            prob4 = tf.exp(-prob4*0.5/0.3)/np.sqrt(2*np.pi*0.3)
+            prob_sum = tf.maximum(tf.expand_dims(tf.reduce_sum(prob4,axis=[1,2]),1),1e-10)
+            prob4 = prob4/tf.expand_dims(prob_sum,1)
+            prob = prob3*0.5 + prob4*0.5
+            """
+
+            if t == 0 and (not Blank_bg) and (False):
                 num_clusters = 0
                 x = tf.zeros([tf.shape(rnn_out2)[0],])
                 y = tf.zeros([tf.shape(rnn_out2)[0],])
                 prob2 = prob
             else:
                 num_clusters = T-t
-                if num_clusters == num_clusters:
+                if num_clusters == 1 or (not GMM_EM):
                     mean1 = tf.expand_dims(tf.reduce_sum(prob * ranx, axis=[1, 2]),axis=1)#[:, 0]
                     mean2 = tf.expand_dims(tf.reduce_sum(prob * rany, axis=[1, 2]),axis=1)#[:, 0]
                     prob2 = tf.square(ranx-tf.expand_dims(mean1,1))+tf.square(rany-tf.expand_dims(mean2,1))
@@ -298,8 +365,12 @@ def main(arv):
                     ranx = tf.reshape(ranx,[1,pic_size * pic_size])
                     rany = tf.reshape(rany,[1,pic_size * pic_size])
                     covar = tf.reduce_sum(prob*(tf.square(ranx-mean1)+tf.square(rany-mean2))*0.5,axis=1)
-                    x = sample_from_mvn(mean1[:,0], covar)
-                    y = sample_from_mvn(mean2[:,0], covar)
+                    if not GMM_EM:
+                        x = mean1[:,0]
+                        y = mean2[:,0]
+                    else:
+                        x = sample_from_mvn(mean1[:,0], covar)
+                        y = sample_from_mvn(mean2[:,0], covar)
 
                     covar = tf.expand_dims(tf.expand_dims(covar,axis=1),axis=1)
 
@@ -319,7 +390,8 @@ def main(arv):
                     index = ( tf.range(0,num_clusters,1)/num_clusters)
                     multiply = tf.constant([1])*tf.shape(rnn_out2)[0]
                     mean1 = tf.cast(tf.cos(index*6.283185)*0.5,tf.float32)
-                    mean2 = tf.cast(tf.sin(index*6.283185)*0.5,tf.float32)
+                    mean2 = tf.cast(tf.sin(index*6.283185)*0.5,tf.float32)#tf.stack([tf.sin(index*6.283185)*0.5,tf.cos(index*6.283185)*0.5])
+                    #mean = tf.to_float(mean)#tf.cast(mean,tf.float32)
                     mean1 = tf.tile(mean1,multiply)
                     mean1 = tf.reshape(mean1,[-1,num_clusters])
                     mean2 = tf.tile(mean2,multiply)
@@ -341,6 +413,7 @@ def main(arv):
                         # resp_sum (?,56,56,1)
                         resp_sum = tf.reduce_sum(resp, axis=3, keepdims=True)
                         resp = resp/ resp_sum
+
 
                         #M-step
                         count = tf.reduce_sum(resp*tf.expand_dims(prob,3), axis=[1,2])
@@ -393,6 +466,8 @@ def main(arv):
             #print("x",x.shape)
                 #print("mean",mean[:,0,0].shape)
 
+
+
         return x, y, shift_kl, prob,prob2 #, mean
 
     def comp_para(rnn_out):
@@ -402,13 +477,13 @@ def main(arv):
                     hidden = layers.fully_connected(rnn_out, hidden_units, scope=scope)
                 with tf.variable_scope("output") as scope:
                     sigma_mean = layers.fully_connected(hidden, 1, activation_fn=None, scope=scope)
-            sigma2 = tf.nn.sigmoid(sigma_mean)*0.5
+            sigma2 = tf.nn.softplus(sigma_mean)*0.5
             sigma2 = sigma2[:,0]
             #sigma2,gamma = sigma2[:,0],sigma2[:,1]
         return sigma2#,gamma
 
     def comp_pres(rnn_out,z_pres_kl):
-        if t<=1 and (not Blank_bg) :
+        if t<=1 and (not Blank_bg) and (False):
             z_pres = tf.ones([tf.shape(rnn_out)[0],1, 1, 1])
         else:
             z_pres_prior_log_odds = -2.0
@@ -467,7 +542,7 @@ def main(arv):
                     shf_standard_sample = tf.random_normal([tf.shape(window_v)[0], latent_dim])
                     shf_sample = shf_mean + 1*shf_standard_sample * tf.sqrt(tf.exp(shf_log_var))
                 with tf.variable_scope("decode"):
-                    rec                   = decoder(shf_sample, is_train, [6,7,7,16],vae_generative_units, latent_dim)
+                    rec                   = decoder(shf_sample, is_train, [color_ch*2,7,7,16],vae_generative_units, latent_dim)
                 vae_kl += tf.reduce_mean(0.5 * tf.reduce_sum( tf.log(1.1) - shf_log_var - 1.0 + tf.exp(shf_log_var)/1.1 +
                     tf.square(shf_mean - 0.0)/1.1 , 1))*0.001
                 vae_kl += tf.reduce_mean(tf.square(rec - window_shuff))*win_size*win_size*0.5
@@ -480,27 +555,28 @@ def main(arv):
                     nrm_sample = nrm_mean + 1*nrm_standard_sample * tf.sqrt(tf.exp(nrm_log_var))
                     pack_sample = tf.concat([nrm_sample,shf_sample],axis=1)
                 with tf.variable_scope("decode"):
-                    rec2                  = decoder(pack_sample, is_train, [3,7,7,16],vae_generative_units, latent_dim)
+                    rec2                  = decoder(pack_sample, is_train, [color_ch,7,7,16],vae_generative_units, latent_dim)
                 vae_kl += tf.reduce_mean(0.5 * tf.reduce_sum( tf.log(1.1) - nrm_log_var - 1.0 + tf.exp(nrm_log_var)/10.1 +
                     tf.square(nrm_mean - 0.0)/1.1 , 1))*0.001
 
         return rec2, vae_kl
 
-    def vae(window, vae_kl):
+    def vae(window,window_hat, vae_kl):
         with tf.variable_scope("vae",reuse=DO_SHARE):
-            rec_mean, rec_log_var = encoder(window,is_train,rec_hidden_units,latent_dim)
+            window_v = tf.concat([window,window_hat],axis=3)
+            rec_mean, rec_log_var = encoder(window_v,is_train,rec_hidden_units,latent_dim)
 
             with tf.variable_scope("rec_sample"):
                 standard_normal_sample = tf.random_normal([tf.shape(input_layer)[0], latent_dim])
                 rec_sample = rec_mean + 1*standard_normal_sample * tf.sqrt(tf.exp(rec_log_var))
 
             rec                   = decoder(rec_sample, is_train, [color_ch,7,7,16],vae_generative_units, latent_dim)
-            if t == 0 and (not Blank_bg):
+            if t == 0 and (not Blank_bg) and (False):
                 vae_kl += tf.reduce_mean(0.5 * tf.reduce_sum( tf.log(5.1) - rec_log_var - 1.0 + tf.exp(rec_log_var)/5.1 +
-                    tf.square(rec_mean - (8.0))/5.1 , 1))
+                    tf.square(rec_mean - (8.0))/5.1 , 1))*0.001
             else:
                 vae_kl += tf.reduce_mean(0.5 * tf.reduce_sum( tf.log(5.1) - rec_log_var - 1.0 + tf.exp(rec_log_var)/5.1 +
-                    tf.square(rec_mean - (-8.0))/5.1 , 1))
+                    tf.square(rec_mean - (-8.0))/5.1 , 1))*0.001
 
         return rec, vae_kl
 
@@ -511,43 +587,87 @@ def main(arv):
 
 
     input = input_layer #tf.reshape(input_layer, shape=[-1, pic_size,pic_size, 3])
-    obj_class = unet(input,T+1)
-    #with tf.variable_scope("bg_recon"):
-    #    rec_mean, rec_log_var = encoder(input_layer,is_train,(24, 16, 8),latent_dim)
-    #    input                 = decoder(rec_mean, is_train, [3,7,7,8],(8, 16, 24), latent_dim)
-    #    input = tf.sigmoid(input)
-    #print("input",input[:,:,:,0:1].shape)
+    if (not Blank_bg):
+        bg_enc_units = (32,16)
+        bg_gen_units = (16,32)
+        with tf.variable_scope("bg_recon"):
+            s = tf.ones([tf.shape(input)[0],])*1
+            zeros = tf.zeros_like(s)
+            theta = tf.stack([s, zeros, zeros, zeros, s, zeros], 1)
+            window = spatial_transformer_network(input, theta, (win_size, win_size))
+            with slim.arg_scope(
+                [slim.conv2d, slim.fully_connected],
+                normalizer_fn=slim.batch_norm,
+                activation_fn=lambda x: tf.nn.leaky_relu(x, alpha=0.1),
+                normalizer_params={"is_training": is_train}):
+                with tf.variable_scope("Encode"):
+                    next_layer = window
+                    for i in range(len(bg_enc_units)):
+                        next_layer  = slim.conv2d(next_layer , bg_enc_units[i], [3, 3], scope="encode_conv%d" % (i*2+1))
+                        next_layer  = slim.conv2d(next_layer , bg_enc_units[i], [3, 3], stride=2, scope="encode_conv%d" % (i*2+2))
+                        #next_layer = tf.Print(next_layer,["next_layer",next_layer[0,0,0,:]])
+                        #print("next_layer",next_layer.shape)
+                    next_layer = slim.flatten(next_layer)
+                    bg_mean = slim.fully_connected(next_layer, latent_dim, activation_fn=None)
+                    sigma2 = slim.fully_connected(next_layer, 1, activation_fn=tf.nn.softplus)
+
+                with tf.variable_scope("Dncode"):
+                    next_layer = slim.fully_connected(bg_mean, 7*7*8)
+                    next_layer =tf.reshape(next_layer, [-1, 7,7,8])
+                    w = 7
+                    for i in range(len(bg_gen_units)):
+                        w *=2
+                        next_layer  = slim.conv2d_transpose(next_layer , bg_gen_units[i], [3, 3], scope="decode_conv%d" % (i*2+1))
+                        next_layer = tf.image.resize_images(next_layer,(w,w), method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+                        next_layer  = slim.conv2d(next_layer , bg_gen_units[i], [3, 3], scope="decode_conv%d" % (i*2+2))
+                        #next_layer = tf.Print(next_layer,["next_layer",next_layer[0,0,0,:]])
+                        #print("next_layer",next_layer.shape)
+                    generative_mean = slim.conv2d(next_layer, color_ch, [3, 3],activation_fn=None, padding='same')
+                    #be_recon = tf.nn.sigmoid(generative_mean)
+
+                bg_recon = spatial_transformer_network(generative_mean, theta, (pic_size, pic_size),sigma2)
+                #bg_recon = tf.Print(bg_recon,["bg_recon",bg_recon[0,0,0,:]])
+    if Blank_bg:
+        obj_class = pre_loop(input,input)
+    else:
+        obj_class = pre_loop(input,input - tf.sigmoid(bg_recon))
+
 
 
     scale_kl, shift_kl, z_pres_kl, vae_kl = 0.0, 0.0, 0.0, 0.0
-    cs = [0]*T
+    cs, field_prev = [0]*T, [0]
     s,x,y = [0]*T, [0]*T, [0]*T
     m, sigma2 = [0]*T, [0]*T
     prob, prob2 = [0]*T, [0]*T
     z_pres = 1.0
-    t = 1
+    one_box = tf.ones((tf.shape(input_layer)[0],win_size,win_size,1))
     rnn_state = lstm_rnn.zero_state(tf.shape(input_layer)[0],tf.float32)
+
     for t in range(T):
-        c_prev = tf.zeros((tf.shape(input_layer)[0],pic_size,pic_size,1))-6.5 if t==0 else cs[t-1]
-        #x_hat = input - tf.sigmoid(c_prev)
-        input =tf.concat([obj_class[:,:,:,t:t+1]*input_layer,obj_class[:,:,:,t:t+1]],3)
-        rnn_out1, rnn_state = hidden_rnn(input,rnn_state)
-        s[t], scale_kl = comp_scale(rnn_out1,scale_kl)
-        #x[t], y[t], scale_kl = comp_shift(rnn_out,scale_kl)
-        x[t], y[t],shift_kl, prob[t], prob2[t] = comp_shift2(input,shift_kl)
-        sigma2[t] = comp_para(rnn_out1)
-        z_pres, z_pres_kl = comp_pres(rnn_out1, z_pres_kl)
+        if Blank_bg:
+            c_prev = tf.zeros((tf.shape(input_layer)[0],pic_size,pic_size,1))-6.5 if t==0 else cs[t-1]
+        else:
+            c_prev = bg_recon if t==0 else cs[t-1]
+
+        x_hat = input - tf.sigmoid(c_prev)
+        s[t], sigma2[t], scale_kl = comp_scale(obj_class[:,:,:,t:t+1],scale_kl)
+        x[t], y[t],shift_kl, prob[t], prob2[t] = comp_shift2(obj_class[:,:,:,t:t+1],shift_kl)
+        #z_pres, z_pres_kl = comp_pres(rnn_out1, z_pres_kl)
         #z_pres *= z_pres_t #z_pres = z_pres_t
         zeros = tf.zeros_like(s[t])
         theta = tf.stack([s[t], zeros, x[t], zeros, s[t], y[t]], 1)
         itheta = tf.stack([1.0/s[t], zeros, -x[t]/s[t], zeros, 1.0/s[t], -y[t]/s[t]], 1)
-        window = read(input_layer,theta)
-        rec, vae_kl= vae(window,vae_kl)
-        cs[t] = c_prev + z_pres*write(rec, itheta, sigma2[t])#tf.clip_by_value(c_prev + write(rec, itheta, sigma2),0.0,1.0)
+        window = read(input,theta)
+        window_hat = read(x_hat,theta)
+        if (False):
+            rec, vae_kl= vae_dis(window,window_hat,vae_kl)
+        else:
+            rec, vae_kl= vae(window,window_hat,vae_kl)
 
-        DO_SHARE=True
+        cs[t] = c_prev + write(rec, itheta, sigma2[t])
+        DO_SHARE = True
 
-    window_recon = tf.sigmoid(cs[T-1])
+    window_recon = tf.sigmoid(cs[-1])
     #print("window_recon",window_recon.shape)
 
     # output_true shall have the original image for error calculations
@@ -555,14 +675,8 @@ def main(arv):
 
     with tf.variable_scope("recon_loss1"):
         # define our cost function
-        #_image_weights = brightness_weight(input_layer, neighbor_filter, sigma_I = 10)
-        #image_weights = convert_to_batchTensor(_image_weights)
-        soft_cut = soft_ncut(input_layer, obj_class, dist_weight)
-        soft_cut = tf.reduce_mean(soft_cut)
-        #print("soft_cut",soft_cut.shape)
-        #soft_cut = tf.reduce_mean(soft_cut)
-        #tvloss = tf.reduce_mean(tf.image.total_variation(obj_class))*0.01
         #meansq =    tf.reduce_mean(tf.square(rec - output_true))
+        trick = - tf.reduce_mean(tf.square(window_hat))*500
         meansq =    tf.reduce_mean(tf.square(window_recon - output_true))
         meansq *= win_size*win_size#*0.01
         meansq2 =    tf.reduce_mean(tf.square(input - output_true))
@@ -571,7 +685,7 @@ def main(arv):
             (1.0 - output_true) * tf.log(1.0 - window_recon+ 10e-10))
         binarcs *=win_size
         if data_type == 1 or data_type == 2:
-            vae_loss = binarcs + meansq*2.5  +scale_kl +shift_kl+vae_kl*0.001 + z_pres_kl*0.1 + soft_cut
+            vae_loss = binarcs + meansq*2.5  +scale_kl +shift_kl+vae_kl*1.0 + z_pres_kl*0.1 +trick*0.0
         elif data_type == 2:
             vae_loss = meansq +scale_kl +shift_kl+vae_kl*0.01
 
@@ -579,11 +693,10 @@ def main(arv):
 
 
     t_vars = tf.trainable_variables()
-    unet_vars = [var for var in t_vars if "unet" in var.name]
+    vae_vars = [var for var in t_vars if 'vae' in var.name]
     # define our optimizer
     learn_rate = 0.001#0.0005   # how fast the model should learn
     slimopt = slim.learning.create_train_op(vae_loss, tf.train.AdamOptimizer(learn_rate))
-    unetopt = slim.learning.create_train_op(vae_loss, tf.train.AdamOptimizer(learn_rate), variables_to_train=unet_vars)
 
     # initialising stuff and starting the session
     init = tf.global_variables_initializer()
@@ -606,19 +719,23 @@ def main(arv):
                     #tf.summary.scalar("shift_kl", shift_kl),
                     tf.summary.scalar("z_pres_kl", z_pres_kl),
                     tf.summary.scalar("vae_kl", vae_kl),
-                    tf.summary.scalar("soft_cut", soft_cut),
+                    tf.summary.scalar("tricky_term", trick),
                     #tf.summary.histogram("scale0", s[0]),
                     #tf.summary.histogram("scale1", s[1]),
-                    tf.summary.image("rec_window", tf.reshape(tf.sigmoid(rec), [-1, win_size, win_size, color_ch])),
+                    tf.summary.image("rec_window", tf.reshape(rec, [-1, win_size, win_size, color_ch])),
+                    #tf.summary.image("sum_map", tf.reshape(sss, [-1, pic_size, pic_size, 1])),
                     tf.summary.image("cs0", tf.reshape(tf.sigmoid(cs[0]), [-1, pic_size, pic_size, color_ch]) ),
+                    #tf.summary.image("input_recon", tf.reshape(input, [-1, pic_size, pic_size, 3]) ),
                     tf.summary.image("recon", tf.reshape(window_recon, [-1, pic_size, pic_size, color_ch]) ),
-                    tf.summary.image("t1-class", obj_class[:,:,:,0:1]),
+                    tf.summary.image("window", tf.reshape(window, [-1, win_size, win_size, color_ch])),
                     tf.summary.image("t1-non-para-map", tf.reshape(prob[0], [-1, pic_size, pic_size,1])),
                     tf.summary.image("t1-para-map", tf.reshape(prob2[0], [-1, pic_size, pic_size,1])),
-                    tf.summary.image("t2-class", obj_class[:,:,:,1:2]),
+                    tf.summary.image("t1-class", obj_class[:,:,:,0:1]),
                     tf.summary.image("t2-non-para-map", tf.reshape(prob[1], [-1, pic_size, pic_size,1])),
                     tf.summary.image("t2-para-map", tf.reshape(prob2[1], [-1, pic_size, pic_size,1])),
-                    tf.summary.image("window", window ),
+                    tf.summary.image("t2-class", obj_class[:,:,:,1:2]),
+                    tf.summary.image("error", tf.reshape(tf.reduce_sum(tf.square(x_hat),3, keepdims=True), [-1, pic_size, pic_size, 1])),
+                    #tf.summary.image("bypart", tf.reshape(window_recon2, [-1, pic_size, pic_size, 1]) ),
                     ])
 
 
@@ -640,11 +757,9 @@ def main(arv):
             any_image = x_true[j]
             x_decoded,p_map,error \
                 ,sa1,sa2,sca,sig1 \
-                ,sh1,sh2,sc,sig2\
-                 ,zz    = sess.run([window_recon,prob2[0],meansq
-                            ,x[0],y[0],s[0],sigma2[0]\
+                ,sh1,sh2,sc,sig2 = sess.run([window_recon,prob2[0],meansq
                             ,x[1],y[1],s[1],sigma2[1]\
-                            ,z_pres],\
+                            ,x[0],y[0],s[0],sigma2[0]],\
                            feed_dict={input_layer:[any_image], output_true:[any_image], is_train: False})
             x_dec = x_decoded[0]#.reshape(pic_size, pic_size)
             p_map = p_map[0]
@@ -685,16 +800,16 @@ def main(arv):
             ry = cy + sy
 
             Box_color = [0,.8,0] if color_ch==3 else .50
-            if zz>0.5:
-                x_tt[max(0,min(pic_size-1,int(ly))):max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(lx))),:] = Box_color
-                x_tt[max(0,min(pic_size-1,int(ly))):max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(rx))),:] = Box_color
-                x_tt[max(0,min(pic_size-1,int(ly))),max(0,min(pic_size-1,int(lx))):max(0,min(pic_size-1,int(rx))),:] = Box_color
-                x_tt[max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(lx))):max(0,min(pic_size-1,int(rx))),:] = Box_color
 
-                x_dec[max(0,min(pic_size-1,int(ly))):max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(lx))),:] = Box_color
-                x_dec[max(0,min(pic_size-1,int(ly))):max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(rx))),:] = Box_color
-                x_dec[max(0,min(pic_size-1,int(ly))),max(0,min(pic_size-1,int(lx))):max(0,min(pic_size-1,int(rx))),:] = Box_color
-                x_dec[max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(lx))):max(0,min(pic_size-1,int(rx))),:] = Box_color
+            x_tt[max(0,min(pic_size-1,int(ly))):max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(lx))),:] = Box_color
+            x_tt[max(0,min(pic_size-1,int(ly))):max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(rx))),:] = Box_color
+            x_tt[max(0,min(pic_size-1,int(ly))),max(0,min(pic_size-1,int(lx))):max(0,min(pic_size-1,int(rx))),:] = Box_color
+            x_tt[max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(lx))):max(0,min(pic_size-1,int(rx))),:] = Box_color
+
+            x_dec[max(0,min(pic_size-1,int(ly))):max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(lx))),:] = Box_color
+            x_dec[max(0,min(pic_size-1,int(ly))):max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(rx))),:] = Box_color
+            x_dec[max(0,min(pic_size-1,int(ly))),max(0,min(pic_size-1,int(lx))):max(0,min(pic_size-1,int(rx))),:] = Box_color
+            x_dec[max(0,min(pic_size-1,int(ry))),max(0,min(pic_size-1,int(lx))):max(0,min(pic_size-1,int(rx))),:] = Box_color
 
 
             x_tt = x_tt if color_ch==3 else x_tt[:,:,0]
@@ -703,7 +818,7 @@ def main(arv):
             plt.title('%2d step' %index)
             ax = plt.subplot(num_rows, 2*num_cols, 2*i+1)
             plt.imshow(x_tt ,  cmap='Greys')
-            plt.xlabel("(%.2f %.2f) %.2f %.2f %.2f"% (sh1,sh2,sc,sig1,zz))
+            plt.xlabel("(%.2f %.2f) %.2f %.2f"% (sh1,sh2,sc,sig1))
             plt.xticks([])
             plt.yticks([])
             ax = plt.subplot(num_rows, 2*num_cols, 2*i+2)
@@ -728,8 +843,6 @@ def main(arv):
         for i in range(int(tot_images/batch_size)):
             #epoch_x = get_batch(batch_size,batch_size*i,True)
             epoch_x = all_images[ i*batch_size : (i+1)*batch_size ]
-            #_,c      = sess.run([unetopt,soft_cut],feed_dict={input_layer:epoch_x,
-            #          output_true:epoch_x, is_train:True})
             _,c,pmap = sess.run([slimopt,vae_loss,prob],feed_dict={input_layer:epoch_x,
                       output_true:epoch_x, is_train:True})
             epoch_loss += c
